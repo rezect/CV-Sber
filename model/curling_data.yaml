@@ -1,0 +1,9 @@
+# Model config
+
+train: ./frames/train
+val: ./frames/val
+
+names:
+  0: home
+  1: yellow-stone
+  2: red-stone
