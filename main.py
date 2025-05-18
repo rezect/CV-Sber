@@ -4,7 +4,9 @@ import math
 from ultralytics import YOLO
 from scipy.optimize import minimize
 
-MAX_FRAMES_HOME_APPEARENCE = 100
+MAX_FRAMES_HOME_APPEARENCE = 30
+
+# TODO: детектить ВСЕ камни -> считать их реальные координаты -> учитывать только те, кто в пределах площадки
 
 class CurlingStoneCounter:
     def __init__(self, model_path, conf, debug=False):
@@ -25,6 +27,7 @@ class CurlingStoneCounter:
         self.house_radius_meters = 1.83  # Радиус дома
         self.hogline_distance_meters = 6.4  # Расстояние от центра дома до линии хог
         self.stone_tadius_meters = 0.279  # Расстояние от центра дома до линии хог
+
         self.hogline_to_house = self.hogline_distance_meters / \
             self.house_radius_meters  # На сколько hogline больше home
         self.stone_to_house = self.stone_tadius_meters / self.house_radius_meters  # Какую часть радиус камня составляет от радиуса дома
@@ -39,9 +42,11 @@ class CurlingStoneCounter:
             'red': 0
         }
 
-        self.last_known_home = None
+        self.last_known_home = {
+            'center': (0, 0),
+            'radius': (0, 0)
+        }
         self.home_persistence = 0
-        self.home_missing_frames = 0
 
         self.tracked_stones = []
 
@@ -79,7 +84,98 @@ class CurlingStoneCounter:
 
         return center_x, center_y, radius_x, radius_y
     
-    def process_frame(self, frame, frame_heigth):
+    def is_point_on_playing_area(self, point):
+        """
+        Проверяет положение точки на игровом поле в кёрлинге.
+        
+        Параметры:
+        - point: кортеж (x, y) с координатами точки в метрах относительно центра дома
+        
+        Возвращает:
+        - "IN_HOUSE": если точка находится в доме (в радиусе 1.83 м от центра)
+        - "ON_HOG_LINE": если точка находится на линии хог (y = 6.4 м)
+        - "ON_PLAYING_FIELD": если точка находится на игровом поле, но не в доме и не на линии хог
+        - "OUT_OF_FIELD": если точка за пределами игрового поля
+        
+        Координатная система:
+        - Центр координат (0, 0) - центр дома
+        - y - против направления бросания камней
+        - x - вправо от y, если смотреть из центра в сторону y
+        """
+
+        x, y = point
+
+        # Параметры поля в кёрлинге (в метрах)
+        house_radius = 1.83  # Радиус дома
+        hog_line_y = 6.4     # Позиция линии хог
+        field_length = 45.72  # Длина игрового поля
+        field_width = 5.0     # Ширина игрового поля
+
+        # Допуск для проверки нахождения точки на линии
+        epsilon = 0.1
+
+        # Проверка нахождения в доме
+        distance_from_center = (x**2 + y**2)**0.5
+        if distance_from_center <= house_radius:
+            return "IN_HOUSE"
+
+        # Проверка нахождения на линии хог
+        if hog_line_y - y < epsilon:
+            # Проверяем, что точка не выходит за ширину поля
+            if abs(x) <= field_width / 2:
+                return "ON_HOG_LINE"
+
+        # Проверка нахождения на игровом поле
+        if 0 <= y <= field_length and abs(x) <= field_width / 2:
+            return "ON_PLAYING_FIELD"
+
+        return "OUT_OF_FIELD"
+
+    def get_real_coords(self, home_box, point, is_front_view):
+        """
+        Обрабатывает координаты на изображении в реальные координаты относительно центра дома
+
+        Args:
+            home_bos: координаты видимого дома [x1, y1, x2, y2]
+            point: координаты точки [x, y]
+
+        Returns:
+            cords: координаты в СО относительно центра дома[x, y]
+        """
+        x_center = (home_box[0] + home_box[2]) / 2
+        y_center = (home_box[1] + home_box[3]) / 2
+        
+        if is_front_view:
+            image_points = np.array([
+                [x_center, home_box[3]],
+                [x_center, home_box[1]],
+                [home_box[2], y_center],
+                [home_box[0], y_center]
+            ], dtype=np.float32)
+        else:
+            image_points = np.array([
+                [x_center, home_box[1]],
+                [x_center, home_box[3]],
+                [home_box[0], y_center],
+                [home_box[2], y_center]
+            ], dtype=np.float32)
+
+        home_radius = self.house_radius_meters
+
+        real_points = np.array([
+            [0, home_radius],    # Top
+            [0, -home_radius],   # Bottom
+            [-home_radius, 0],   # Left
+            [home_radius, 0]     # Right
+        ], dtype=np.float32)
+
+        H, _ = cv2.findHomography(image_points, real_points)
+
+        point_array = np.array([[point]], dtype=np.float32)
+
+        return cv2.perspectiveTransform(point_array, H)[0][0]
+        
+    def process_frame(self, frame):
         """
         Обрабатывает кадр для подсчета камней
         
@@ -103,9 +199,13 @@ class CurlingStoneCounter:
         # Найти параметры дома
         home_center = None
         home_radius = None
+        
+        # Если есть дом, то новый ли он
+        is_this_new_home = True
+        is_trusted_home = False
+        is_front_view = False
 
         if len(home_boxes) > 0:
-            # TODO: Сделать не самый большой, а самый центральный
             # Берем самый большой детектированный дом
             home_box = home_boxes[np.argmax((home_boxes[:, 2] - home_boxes[:, 0]) *
                                             (home_boxes[:, 3] - home_boxes[:, 1]))]
@@ -116,11 +216,21 @@ class CurlingStoneCounter:
             home_center = (home_center_x, home_center_y)
             home_radius = (home_radius_x, home_radius_y)
 
-            is_this_new_home = False
+            prev_home_radius_y = self.last_known_home['radius'][1]
+            prev_home_center_y = self.last_known_home['center'][1]
 
-            if self.last_known_home:
-                if self.last_known_home['radius'][1] > 1.2 * home_radius_y:
-                    is_this_new_home = True
+            if abs(home_radius_y - prev_home_radius_y) > 1.1 * prev_home_radius_y or abs(home_center_y - prev_home_center_y) > 10:
+                # Если новый радиус или координата центра дома по оси y сильно отличаются, то это новый дом => ненадежный
+                is_this_new_home = True
+                is_this_new_home = False
+            else:
+                is_this_new_home = False
+                # Проверяем - надежный ли дом
+                if self.home_persistence > MAX_FRAMES_HOME_APPEARENCE:
+                    is_trusted_home = True
+
+            if abs(home_radius_x - home_radius_y) > 20:
+                is_front_view = True
 
             # Обновляем последние известные параметры дома
             self.last_known_home = {
@@ -128,121 +238,108 @@ class CurlingStoneCounter:
                 'radius': home_radius
             }
 
-            # Если новый дом, то скидываем счетчики
+            # Если новый дом, то скидываем счетчик
             if is_this_new_home:
                 self.home_persistence = 0
-                self.home_frames_missing = 0
             else:
-                self.home_frames_missing = 0
                 self.home_persistence += 1
-                
         else:
-            self.home_frames_missing = 0
+            # Если дома нет на кадре, тоже скидываем счетчик
             self.home_persistence = 0
-
-        # Если у нас есть информация о доме, подсчитываем камни
-        if home_center and home_radius:
+                
+        # Если у нас есть информация о доме и он НАДЕЖНЫЙ, подсчитываем камни
+        if home_center and home_radius and is_trusted_home:
             # Объединяем все камни
             all_stones = np.vstack([yellow_stones, red_stones]) if len(yellow_stones) > 0 and len(red_stones) > 0 else (
                 yellow_stones if len(yellow_stones) > 0 else (red_stones if len(red_stones) > 0 else np.array([])))
 
             # Подсчет камней в доме и на линии хог
             stones_in_house = []
-            stones_on_hogline = []
-
-            # Пиксельное соотношение между радиусом дома и расстоянием до линии хог
-            pixels_per_meter = home_radius[0] / self.house_radius_meters
-            hogline_distance_pixels = self.hogline_distance_meters * pixels_per_meter
+            stones_before_hogline = []
 
             for stone in all_stones:
-                stone_center = self.get_stone_center(stone)
+                image_stone_center = self.get_stone_center(stone)
+
+                real_stone_center = self.get_real_coords(
+                    home_box, image_stone_center, is_front_view)
+                
+                point_position = self.is_point_on_playing_area(
+                    real_stone_center)
 
                 # Проверяем, где находится камень
-                # TODO: Преобразовывать всё таки в координаты (понадобится далее)
-                # Берем круг, плюс половина диаметра шара (тк касающиеся линии тоже считаются в доме)
-                if self.is_point_in_ellipse(stone_center, home_center, home_radius[0] * (1 + self.stone_to_house / 2), home_radius[1] * (1 + self.stone_to_house / 2)):
+                if point_position == "IN_HOUSE":
                     stones_in_house.append({
                         'box': stone,
-                        'center': stone_center,
-                        'color': 'yellow' if stone in yellow_stones else 'red'
+                        'image_coords': image_stone_center,
+                        'color': 'yellow' if stone in yellow_stones else 'red',
+                        'real_coords': real_stone_center
                     })
-                elif self.is_point_in_ellipse(stone_center, home_center, home_radius[0] * self.hogline_to_house, home_radius[1] * self.hogline_to_house):
-                    stones_on_hogline.append({
+                elif point_position == "ON_PLAYING_FIELD":
+                    stones_before_hogline.append({
                         'box': stone,
-                        'center': stone_center,
-                        'color': 'yellow' if stone in yellow_stones else 'red'
+                        'image_coords': image_stone_center,
+                        'color': 'yellow' if stone in yellow_stones else 'red',
+                        'real_coords': real_stone_center
                     })
 
             # Подготовка результатов
-            if self.home_persistence > MAX_FRAMES_HOME_APPEARENCE and home_radius[0] == home_radius[1]:
-                results = {
-                    'stones_in_house': {
-                        'total': len(stones_in_house),
-                        'yellow': sum(1 for s in stones_in_house if s['color'] == 'yellow'),
-                        'red': sum(1 for s in stones_in_house if s['color'] == 'red')
-                    },
-                    'stones_on_hogline': {
-                        'total': len(stones_on_hogline),
-                        'yellow': sum(1 for s in stones_on_hogline if s['color'] == 'yellow'),
-                        'red': sum(1 for s in stones_on_hogline if s['color'] == 'red')
-                    },
-                    'home_center': home_center,
-                    'home_radius': home_radius,
-                    'is_home_valid': self.home_persistence > 50
-                }
-            else:
-                return None
-            
+            results = {
+                'stones_in_house': {
+                    'total': len(stones_in_house),
+                    'yellow': sum(1 for s in stones_in_house if s['color'] == 'yellow'),
+                    'red': sum(1 for s in stones_in_house if s['color'] == 'red')
+                },
+                'stones_before_hogline': {
+                    'total': len(stones_before_hogline),
+                    'yellow': sum(1 for s in stones_before_hogline if s['color'] == 'yellow'),
+                    'red': sum(1 for s in stones_before_hogline if s['color'] == 'red')
+                },
+                'home_center': home_center,
+                'home_radius': home_radius
+            }
+
             # Визуализация для отладки
             if self.debug:
-                # Рисуем дом
-                cv2.ellipse(frame, (int(home_center[0]), int(home_center[1])),
-                            (int(home_radius[0]), int(home_radius[1])),
-                            0, 0, 360, (255, 0, 0), 2)
+                # Рисуем дом и линию хог
+                if is_trusted_home:
+                    cv2.ellipse(frame, (int(home_center[0]), int(home_center[1])),
+                                (int(home_radius[0]), int(home_radius[1])),
+                                0, 0, 360, (255, 0, 0), 2)
 
-                # Рисуем линию хог
-                cv2.circle(frame, (int(home_center[0]), int(home_center[1])),
-                           int(hogline_distance_pixels), (0, 255, 0), 2)
+                    cv2.ellipse(frame, (int(home_center[0]), int(home_center[1])),
+                                (int(home_radius[0] * self.hogline_to_house),
+                                    int(home_radius[1] * self.hogline_to_house)),
+                                0, 0, 360, (255, 0, 0), 2)
 
                 # Рисуем камни
                 for stone in stones_in_house:
                     color = (0, 255, 255) if stone['color'] == 'yellow' else (
                         0, 0, 255)
                     cv2.rectangle(frame,
-                                  (int(stone['box'][0]), int(stone['box'][1])),
-                                  (int(stone['box'][2]), int(stone['box'][3])),
-                                  color, 2)
+                                (int(stone['box'][0]), int(stone['box'][1])),
+                                (int(stone['box'][2]), int(stone['box'][3])),
+                                color, 2)
 
-                for stone in stones_on_hogline:
+                for stone in stones_before_hogline:
                     color = (0, 255, 255) if stone['color'] == 'yellow' else (
                         0, 0, 255)
                     cv2.rectangle(frame,
-                                  (int(stone['box'][0]), int(stone['box'][1])),
-                                  (int(stone['box'][2]), int(stone['box'][3])),
-                                  color, 2)
+                                (int(stone['box'][0]), int(stone['box'][1])),
+                                (int(stone['box'][2]), int(stone['box'][3])),
+                                color, 2)
 
                 cv2.imshow('Debug', frame)
                 cv2.waitKey(1)
 
             return results
+            
         else:
-            # Дом не найден и нет последних известных параметров
+            # Дом не найден или он ненадежный
             return None
 
     def get_stone_center(self, stone_box):
         """Возвращает центр камня"""
         return ((stone_box[0] + stone_box[2]) / 2, (stone_box[1] + stone_box[3]) / 2)
-    
-    def is_point_in_ellipse(self, point, center, radius_x, radius_y):
-        """Проверяет, находится ли точка внутри овала (эллипса)"""
-        dx = point[0] - center[0]
-        dy = point[1] - center[1]
-
-        return (dx/radius_x)**2 + (dy/radius_y)**2 <= 1
-
-    def is_point_in_circle(self, point, center, radius):
-        """Проверяет, находится ли точка внутри круга"""
-        return math.sqrt((point[0] - center[0])**2 + (point[1] - center[1])**2) <= radius
     
     def process_video(self, video_path, output_path=None):
         """
@@ -275,7 +372,7 @@ class CurlingStoneCounter:
                 break
 
             # Обработка кадра
-            frame_result = self.process_frame(frame, height)
+            frame_result = self.process_frame(frame)
 
             if frame_result:
                 results.append(frame_result)
@@ -283,7 +380,6 @@ class CurlingStoneCounter:
                 # Визуализация результатов на кадре
                 if output_path:
                     output_frame = frame.copy()
-                    is_home_valid = frame_result['is_home_valid']
                     home_center = frame_result['home_center']
                     home_radius = frame_result['home_radius']
 
@@ -292,9 +388,15 @@ class CurlingStoneCounter:
                                 (int(home_radius[0]), int(home_radius[1])),
                                 0, 0, 360, (255, 0, 0), 2)
 
+                    # Обновляем информацию о камнях
+                    self.home_stones['yellow'] = frame_result['stones_in_house']['yellow']
+                    self.home_stones['red'] = frame_result['stones_in_house']['red']
+                    self.hogline_stones['yellow'] = frame_result['stones_before_hogline']['yellow']
+                    self.hogline_stones['red'] = frame_result['stones_before_hogline']['red']
+
                     # Рисуем информацию о камнях
-                    text_yellow = f"Yellow: House={frame_result['stones_in_house']['yellow']}, Hog={frame_result['stones_on_hogline']['yellow']}"
-                    text_red = f"Red: House={frame_result['stones_in_house']['red']}, Hog={frame_result['stones_on_hogline']['red']}"
+                    text_yellow = f"Yellow: House={frame_result['stones_in_house']['yellow']}, Hog={frame_result['stones_before_hogline']['yellow']}"
+                    text_red = f"Red: House={frame_result['stones_in_house']['red']}, Hog={frame_result['stones_before_hogline']['red']}"
 
                     cv2.putText(output_frame, text_yellow, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                                 1, (0, 255, 255), 2)
@@ -303,9 +405,20 @@ class CurlingStoneCounter:
 
                     out.write(output_frame)
             else:
-                # Если дом не найден, записываем оригинальный кадр
+                # Если дом не найден, записываем кадр с имеющимися значениями
                 if output_path:
-                    out.write(frame)
+                    output_frame = frame.copy()
+
+                    # Рисуем информацию о камнях
+                    text_yellow = f"Yellow: House={self.home_stones['yellow']}, Hog={self.hogline_stones['yellow']}"
+                    text_red = f"Red: House={self.home_stones['red']}, Hog={self.hogline_stones['red']}"
+
+                    cv2.putText(output_frame, text_yellow, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                1, (0, 255, 255), 2)
+                    cv2.putText(output_frame, text_red, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                                1, (0, 0, 255), 2)
+                    
+                    out.write(output_frame)
 
             frame_idx += 1
             print(
