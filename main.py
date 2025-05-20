@@ -4,7 +4,7 @@ import math
 from ultralytics import YOLO
 from scipy.optimize import minimize
 
-MAX_FRAMES_HOME_APPEARENCE = 30
+MAX_FRAMES_HOME_APPEARENCE = 50
 
 class CurlingStoneCounter:
     def __init__(self, model_path, conf, debug=False):
@@ -235,6 +235,14 @@ class CurlingStoneCounter:
             home_center = (home_center_x, home_center_y)
             home_radius = (home_radius_x, home_radius_y)
 
+            # Меняем home_box, пишем реальные корды
+            home_box = np.array([
+                home_center_x - home_radius_x,
+                home_center_y - home_radius_y,
+                home_center_x + home_radius_x,
+                home_center_y + home_radius_y
+            ])
+
             prev_home_radius_y = self.last_known_home['radius'][1]
             prev_home_center_y = self.last_known_home['center'][1]
 
@@ -433,7 +441,7 @@ class CurlingStoneCounter:
         real_vis_height = 800
 
         # Переменная для превращения метров в пиксели
-        scale = real_vis_height // (self.hogline_distance_meters + self.house_radius_meters)
+        scale = real_vis_height / (self.hogline_distance_meters + self.house_radius_meters)
 
         # Получаем ширину поля в пикселях для визуализации
         real_vis_width = int(self.field_width * scale)
@@ -445,8 +453,8 @@ class CurlingStoneCounter:
                         self.house_radius_meters * scale))
         
         # Draw concentric circles for house
-        for r in [self.house_radius_meters, self.house_radius_meters * 0.75,
-                self.house_radius_meters * 0.5, self.house_radius_meters * 0.25]:
+        for r in [self.house_radius_meters, 1.22,
+                  0.61, 0.025]:
             radius_px = int(r * scale)
             cv2.circle(real_vis, center_point, radius_px, (200, 200, 200), 2)
         
