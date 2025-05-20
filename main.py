@@ -124,7 +124,7 @@ class CurlingStoneCounter:
 
         return "OUT_OF_FIELD"
 
-    def get_real_coords(self, home_box, point, is_front_view):
+    def get_real_coords(self, home_box, point, is_front_view, stone_box):
         """
         Обрабатывает координаты на изображении в реальные координаты относительно центра дома
 
@@ -135,6 +135,16 @@ class CurlingStoneCounter:
         Returns:
             cords: координаты в СО относительно центра дома[x, y]
         """
+        if is_front_view:
+            # Если вид спереди, то надо немного подвинуть координаты по оси Y вперед (вверх от дома), тк имеется небольшое искажение
+            home_x_diametr = home_box[2] - home_box[0]
+            home_y_diametr = home_box[3] - home_box[1]
+            cos_angle = home_y_diametr / home_x_diametr
+
+            # Применяем смещение
+            point = self.cords_bias(
+                point, cos_angle, stone_box)
+
         x_center = (home_box[0] + home_box[2]) / 2
         y_center = (home_box[1] + home_box[3]) / 2
         
@@ -168,31 +178,33 @@ class CurlingStoneCounter:
 
         real_point_coords = cv2.perspectiveTransform(point_array, H)[0][0]
 
-        # if is_front_view:
-        #     # Если вид спереди, то надо немного подвинуть координаты по оси Y вперед (вверх от дома), тк имеется небольшое искажение
-        #     # Получаем косинус угла наклона
-        #     home_x_diametr = home_box[2] - home_box[0]
-        #     home_y_diametr = home_box[3] - home_box[1]
-        #     cos_angle = home_y_diametr / home_x_diametr
-
-        #     # Применяем смещение
-        #     real_point_coords = self.cords_bias(
-        #         real_point_coords, cos_angle)
-
         return real_point_coords
     
-    # def cords_bias(self, point, cos_b):
-    #     def ctg(x):
-    #         return math.cos(x) / math.sin(x)
-    #     # Данные о камне
-    #     a = self.stone_radius_meters
-    #     h = self.stone_heigth
+    def cords_bias(self, point, cos_b, stone_box):
+        # Данные о камне
+        scale = abs(stone_box[0] - stone_box[2]) / (self.stone_radius_meters * 2)
+        im_h = abs(stone_box[1] - stone_box[3])
+        a = self.stone_radius_meters * scale
 
-    #     # Получаем b
-    #     b = h * ctg(math.acos(cos_b))
-    #     l = 2 * a + b
-    #     rat = (l / 2) / (a)
+        # Доп переменные
+        y_top = stone_box[1]
+        y_bottom = stone_box[3]
 
+        # Получаем отношение реальной координаты центра на изображении к имеющейся
+        l = im_h / cos_b
+        rat = (a) / (l / 2)
+        
+        # Получаем длину (в пикселях) до реального центра на изображении от нижней границы
+        c = abs(y_top - y_bottom) / 2
+        x = rat * c
+
+        new_y = y_bottom - x
+
+        print("=" * 50)
+        print(
+            f"Y_top: {y_top}\nY_bottom: {y_bottom}\nPont: {point[0]}:{point[1]}\nBias: {x}\nNew im y: {new_y}")
+
+        return (point[0], new_y)
         
     def process_frame(self, frame):
         """
@@ -288,7 +300,7 @@ class CurlingStoneCounter:
                 image_stone_center = self.get_stone_center(stone)
 
                 real_stone_center = self.get_real_coords(
-                    home_box, image_stone_center, is_front_view)
+                    home_box, image_stone_center, is_front_view, stone)
                 
                 point_position = self.is_point_on_playing_area(
                     real_stone_center)
@@ -524,7 +536,7 @@ if __name__ == "__main__":
     # Пути к файлам
     model_path = "runs/detect/curling_detector/weights/best.pt"  # Путь к модели
     video_path = "croped_end.mov"   # Путь к видео
-    output_path = "results/curling_results.mp4"  # Путь для результата
+    output_path = "results/curling_results_new.mp4"  # Путь для результата
 
     # Создаем счетчик камней
     counter = CurlingStoneCounter(model_path, 0.3, debug=True)
