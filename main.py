@@ -1,9 +1,8 @@
 import cv2
 import numpy as np
-import math
 from ultralytics import YOLO
-from scipy.optimize import minimize
 
+CONFIDENCE_TRASHOLD = 0.8
 MAX_FRAMES_HOME_APPEARENCE = 50
 
 class CurlingStoneCounter:
@@ -28,7 +27,6 @@ class CurlingStoneCounter:
         self.stone_heigth = 0.114               # Высота камня
         self.field_width = 4.75                 # Ширина площадки
 
-        # TODO: Реализовать поумнее подсчет камней в доме и на линии хог
         self.hogline_stones = {
             'yellow': 0,
             'red': 0
@@ -101,25 +99,13 @@ class CurlingStoneCounter:
 
         x, y = point
 
-        # Параметры поля в кёрлинге (в метрах)
-        field_length = 45.72  # Длина игрового поля
-
-        # Допуск для проверки нахождения точки на линии
-        epsilon = 0.1
-
         # Проверка нахождения в доме
         distance_from_center = (x**2 + y**2)**0.5
         if distance_from_center <= self.house_radius_meters:
             return "IN_HOUSE"
 
-        # Проверка нахождения на линии хог
-        if self.hogline_distance_meters - y < epsilon:
-            # Проверяем, что точка не выходит за ширину поля
-            if abs(x) <= self.field_width / 2:
-                return "ON_HOG_LINE"
-
         # Проверка нахождения на игровом поле
-        if 0 <= y <= field_length and abs(x) <= self.field_width / 2:
+        if 0 <= y <= self.hogline_distance_meters and abs(x) <= self.field_width / 2:
             return "ON_PLAYING_FIELD"
 
         return "OUT_OF_FIELD"
@@ -216,11 +202,34 @@ class CurlingStoneCounter:
         Returns:
             словарь с результатами анализа
         """
-        model_pred = self.model.predict(frame, conf=self.conf, verbose=False)[0]
+        height, width = frame.shape[:2]
+        square_size = height
 
-        # Извлечение информации о боксах и классах
+        if width < height:
+            square_size = width
+
+        x_center = width // 2
+        y_center = height // 2
+
+        x_start = max(0, x_center - square_size // 2)
+        y_start = max(0, y_center - square_size // 2)
+        x_end = min(width, x_center + square_size // 2)
+        y_end = min(height, y_center + square_size // 2)
+
+        roi = frame[y_start:y_end, x_start:x_end]
+
+        model_pred = self.model.predict(
+            roi, conf=self.conf, verbose=False)[0]
+
         boxes = model_pred.boxes.xyxy.cpu().numpy()
         classes = model_pred.boxes.cls.cpu().numpy()
+
+        # Преобразуем координаты обратно к оригинальному кадру
+        for i in range(len(boxes)):
+            boxes[i][0] += x_start  # x_min
+            boxes[i][1] += y_start  # y_min
+            boxes[i][2] += x_start  # x_max
+            boxes[i][3] += y_start  # y_max
 
         # Обработка результатов детекции
         home_boxes = boxes[classes == 0] if len(boxes) > 0 else np.array([])
@@ -321,15 +330,15 @@ class CurlingStoneCounter:
                         'real_coords': real_stone_center
                     })
 
-                self.home_stones = {
-                    'yellow': sum(1 for s in stones_in_house if s['color'] == 'yellow'),
-                    'red': sum(1 for s in stones_in_house if s['color'] == 'red')
-                }
+            self.home_stones = {
+                'yellow': sum(1 for s in stones_in_house if s['color'] == 'yellow'),
+                'red': sum(1 for s in stones_in_house if s['color'] == 'red')
+            }
 
-                self.hogline_stones = {
-                    'yellow': sum(1 for s in stones_before_hogline if s['color'] == 'yellow'),
-                    'red': sum(1 for s in stones_before_hogline if s['color'] == 'red')
-                }
+            self.hogline_stones = {
+                'yellow': sum(1 for s in stones_before_hogline if s['color'] == 'yellow'),
+                'red': sum(1 for s in stones_before_hogline if s['color'] == 'red')
+            }
 
             # Подготовка результатов
             results = {
@@ -376,7 +385,7 @@ class CurlingStoneCounter:
 
         # Характеристики нового видео
         img_heigth = 800
-        img_width = 800
+        img_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vis_height = 800
         scale = vis_height / (self.hogline_distance_meters + self.house_radius_meters)
         vis_width = self.field_width * scale
@@ -450,7 +459,7 @@ class CurlingStoneCounter:
         home_radius = frame_result['home_radius']
 
         # Create a white canvas for real-world visualization
-        real_vis_height = 800
+        real_vis_height = frame.shape[0]
 
         # Переменная для превращения метров в пиксели
         scale = real_vis_height / (self.hogline_distance_meters + self.house_radius_meters)
@@ -527,7 +536,7 @@ class CurlingStoneCounter:
         
         # Combine both visualizations side by side
         img_vis_resized = cv2.resize(
-            img_vis, (real_vis_height, real_vis_height))
+            img_vis, (frame.shape[1], real_vis_height))
         combined_vis = np.hstack((img_vis_resized, real_vis))
 
         return combined_vis
@@ -535,11 +544,11 @@ class CurlingStoneCounter:
 if __name__ == "__main__":
     # Пути к файлам
     model_path = "runs/detect/curling_detector/weights/best.pt"  # Путь к модели
-    video_path = "croped_end.mov"   # Путь к видео
+    video_path = "end.mov"   # Путь к видео
     output_path = "results/curling_results_new.mp4"  # Путь для результата
 
     # Создаем счетчик камней
-    counter = CurlingStoneCounter(model_path, 0.3, debug=True)
+    counter = CurlingStoneCounter(model_path, CONFIDENCE_TRASHOLD, debug=True)
 
     # Обрабатываем видео
     results = counter.process_video(video_path, output_path)
